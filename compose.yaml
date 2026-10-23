@@ -1,0 +1,8 @@
+services:
+  wxbridge:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${WECHAT_HOST_BIND:-127.0.0.1}:8787:8787"
+    volumes:
+      - ./state:/data

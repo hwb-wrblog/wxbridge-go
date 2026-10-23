@@ -1,0 +1,30 @@
+name: Check and Package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: Focused offline tests
+        run: go test -race -count=1 -buildvcs=false ./internal/workflow ./internal/httpapi ./cmd/wechat-flow ./clientsdk/extinfo
+      - name: Vet
+        run: go vet -buildvcs=false ./internal/workflow ./internal/httpapi ./cmd/wechat-flow ./clientsdk/extinfo
+      - name: Package Linux binaries and source
+        run: ./scripts/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wxbridge-linux
+          path: dist/wxbridge-linux.tar.gz
+          if-no-files-found: error

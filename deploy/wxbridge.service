@@ -1,0 +1,25 @@
+[Unit]
+Description=WxBridge WeChat API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=wxbridge
+StateDirectoryMode=0700
+WorkingDirectory=/opt/wxbridge
+Environment=WECHAT_STATE_DIR=/var/lib/wxbridge
+Environment=WECHAT_LISTEN=127.0.0.1:8787
+ExecStart=/opt/wxbridge/start.sh
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

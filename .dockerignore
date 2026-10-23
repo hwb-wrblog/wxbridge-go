@@ -1,0 +1,12 @@
+.git
+bin
+dist
+state
+.env*
+**/session.json
+**/api-token
+**/sdk.log
+**/*.log
+workflow-runtime*
+media-test
+toolchain
