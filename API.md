@@ -22,16 +22,37 @@ the endpoint performs formal authentication. Generating another QR while an
 authenticated session exists is rejected. QR polling is explicit; background
 message synchronization starts after authentication.
 
+`GET /v1/status` includes the saved account identity at the top level:
+
+```json
+{"ok":true,"authenticated":true,"wxid":"wxid_example","nickname":"Example","avatar_url":""}
+```
+
+Identity strings are empty when logged out. The avatar comes from the login
+notification and can be empty for older sessions. Status reads local state;
+`POST /v1/heartbeat` performs an online check.
+
+To switch accounts, call `POST /v1/logout`, then generate and scan a new QR.
+Logout checks the WeChat response before clearing local identity, session keys,
+pending messages, QR files, uploads, downloaded media and send receipts. It
+preserves the API token and state-directory lock. A remote failure returns 502
+and retains the account. Incomplete local cleanup reports `logout_pending`
+in status and blocks account operations until logout is retried or the service
+restarts and completes cleanup. Logout is also valid without a logged-in account.
+The success body is `{"ok":true,"result":{"authenticated":false,"wxid":"","nickname":"","avatar_url":""}}`.
+Save any required messages and media before logging out.
+
 ## Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/healthz` | Process health |
-| GET | `/v1/status` | Saved login state, last sync/heartbeat and background error |
+| GET | `/v1/status` | Account identity, saved login state, inbox and sync status |
 | GET | `/v1/capabilities` | Tested and unverified capability groups |
 | POST | `/v1/login/qr` | Generate a QR for a new session |
 | GET | `/v1/login/qr/image` | Download the QR image |
 | POST | `/v1/login/check` | Check scan status and authenticate after confirmation |
+| POST | `/v1/logout` | Log out and clear account data before switching accounts |
 | POST | `/v1/heartbeat` | Verify the live session |
 | POST | `/v1/contacts/lookup` | Look up one exact username |
 | POST | `/v1/uploads` | Upload raw file bytes, maximum 32 MiB |
@@ -41,7 +62,8 @@ message synchronization starts after authentication.
 | POST | `/v1/messages/gif` | Upload/send custom GIF bytes |
 | POST | `/v1/messages/voice` | Send encoded AMR-NB/SILK audio |
 | POST | `/v1/messages/video` | Upload/send MP4 and JPEG thumbnail |
-| GET | `/v1/messages?cursor=0&limit=100` | Non-destructive message polling |
+| GET | `/v1/messages?limit=100` | Non-destructive message polling |
+| POST | `/v1/messages/ack` | Cumulatively acknowledge and remove processed messages |
 | POST | `/v1/sync` | Perform one additional synchronization request |
 | POST | `/v1/media/{message_id}/download` | Download a saved media message |
 | GET | `/v1/media/{message_id}` | Read a completed downloaded file |
@@ -76,7 +98,7 @@ curl -X POST http://127.0.0.1:8787/v1/uploads \
   --data-binary @image.png
 ```
 
-Use the returned `upload_id` in a message request. All message endpoints need
+Use the returned `upload_id` in a message request. All send endpoints need
 `Content-Type: application/json` and `Idempotency-Key` headers.
 
 | Endpoint suffix | JSON fields |
@@ -95,15 +117,30 @@ The service does not run FFmpeg or infer audio/video duration.
 
 ## Receive and Download
 
-Poll `/v1/messages` using the returned `next_cursor`; optional `peer=USERNAME`
-filters a conversation. The cursor belongs to this state directory. Responses
-contain string message IDs, sender, recipient, numeric type and creation time.
-Text is included for text messages. Media messages expose `media_kind` and,
-once processed, a `media` record and authenticated `download_url`.
+Poll `/v1/messages` using the returned `next_cursor`; omit `cursor` on the
+first request to start with the earliest unacknowledged message. Optional
+`peer=USERNAME` filters a conversation. Each message has these standard fields:
+
+```json
+{"id":"1234567890123456789","cursor":1,"conversation_id":"wxid_friend","sender_id":"wxid_friend","direction":"incoming","is_group":false,"mentions_me":false,"text":"Hello"}
+```
+
+`direction` is `incoming` or `outgoing` relative to the logged-in account.
+`conversation_id` is the peer username or group ID. Incoming group messages
+extract `sender_id` from the member prefix and remove that prefix from text;
+if no valid prefix is present, `sender_id` is empty. `mentions_me` checks
+structured mention metadata for the account ID or `notify@all`, only on incoming
+group messages. It does not infer mentions from visible text.
+
+The existing `from`, `to`, `type` and `created` fields remain available. `text`
+is empty for non-text messages. Media messages expose `media_kind` and, once
+processed, a `media` record and authenticated `download_url`. Sending still
+returns a receipt; the polling feed contains messages received through WeChat
+sync, so a send receipt should be saved directly by the caller.
 
 ```sh
 curl -H "Authorization: Bearer $WXBRIDGE_TOKEN" \
-  'http://127.0.0.1:8787/v1/messages?cursor=0&limit=100'
+  'http://127.0.0.1:8787/v1/messages?limit=100'
 curl -X POST -H "Authorization: Bearer $WXBRIDGE_TOKEN" \
   http://127.0.0.1:8787/v1/media/MESSAGE_ID/download
 curl -H "Authorization: Bearer $WXBRIDGE_TOKEN" \
@@ -116,12 +153,56 @@ against real incoming media. Failures are explicit; a partial download is
 never served as a completed file. CDN credentials are kept out of the message
 projection returned by the API.
 
+## Acknowledge Messages
+
+Use one consumer for the instance's global inbox. After durably saving every
+message in an **unfiltered** page, acknowledge its `next_cursor`:
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/messages/ack \
+  -H "Authorization: Bearer $WXBRIDGE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"cursor":100}'
+```
+
+```json
+{"ok":true,"result":{"acknowledged":100,"acked_cursor":100,"pending_messages":0}}
+```
+
+Use the actual returned cursor, not the example value. ACK is cumulative and
+global: it removes all message positions before the cursor, including messages
+excluded by `peer` filters. A consumer must not ACK a filtered page unless it has
+already processed all earlier messages from every conversation. No
+`Idempotency-Key` is needed; repeating an ACK returns `acknowledged: 0`.
+
+Cursor positions survive acknowledgement, restart and logout; new messages
+never reuse them. Old sessions migrate with a base cursor of zero. A future
+cursor returns 400. Polling an already removed position returns 410 and the
+current `acked_cursor`; use that cursor or omit the parameter to resume.
+Acknowledging an earlier position is an idempotent no-op. Polling responses include
+`acked_cursor`, `next_cursor` and `more`; each message also has its exclusive
+`cursor` for partial-batch processing.
+
+Incoming media must be downloaded before ACK, otherwise the endpoint returns
+409 with the blocking `message_id`. Retry/manual download failures can be
+explicitly abandoned with `{"cursor":100,"discard_pending_media":true}`;
+those media messages cannot be downloaded later. Completed downloaded files
+remain accessible after ACK and are cleared on logout.
+
+ACK removes message bodies from memory and `session.json`, keeping the inbox
+bounded when the consumer regularly acknowledges messages. It is not a chat
+archive or a media-cache retention policy: unacknowledged messages, completed
+media, uploads, logs and send receipts still consume disk space. Multiple
+accounts use separate instances/state directories, with account registration
+and durable chat history owned by the integrating application.
+
 ## Retry Rules
 
 Use one `Idempotency-Key` per intended message. Same key and same payload:
 the saved response is replayed with `Idempotency-Replayed: true`. Same key and
 different payload: HTTP 409. Interrupted submission after restart: HTTP 409
 with `delivery_unknown: true`; inspect the conversation before using a new key.
+Logout clears send receipts, so keys must not be retried across account switches.
 
 Validation errors use HTTP 400; missing/incorrect token uses 401. Upload size
 violations use 413; unavailable media uses 404. Upstream failures generally

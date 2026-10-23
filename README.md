@@ -16,6 +16,7 @@ Redis, MySQL or an external WeChat gateway.
 | Custom GIF upload/send | Real server acknowledgement; recipient animation not checked |
 | Automatic received-media download | Implemented and tested offline; real receiving flow not yet verified |
 | SILK voice sending | Container/chunk validation tested offline |
+| Account identity, logout/switch, normalized messages and cumulative ACK | Implemented and tested offline |
 | Real-time voice/video calls | Not implemented |
 
 This is a recovered messaging core, not a complete implementation of all
@@ -69,13 +70,22 @@ WxBridge and the canonical repository is
 ## Connect a Project
 
 See [API.md](API.md) for endpoints and examples, including QR login, media
-uploads, sends and cursor-based message polling. A fetch-based JavaScript
+uploads, sends, account switching and cursor-based message polling/acknowledgement. A fetch-based JavaScript
 client is in [examples/client.mjs](examples/client.mjs).
 
 Send operations require a unique `Idempotency-Key`. Reusing the same key and
 request returns the original result without sending again. An interrupted
 request stays marked as unknown after restart; it is never silently retried.
 Message IDs are JSON strings to preserve 64-bit precision.
+
+`GET /v1/status` identifies the account with `wxid`, `nickname` and `avatar_url`.
+`POST /v1/logout` clears the account before a new QR login. Message polling
+provides normalized conversation/sender IDs, direction, group and mention flags.
+One consumer should persist unfiltered pages, then acknowledge `next_cursor`
+through `POST /v1/messages/ack`; acknowledged bodies are removed from memory
+and the session file. Cursors remain stable across cleanup and restart.
+Incoming media must be downloaded or explicitly discarded before ACK. Media
+caches, uploads, logs and send receipts have separate disk-retention needs.
 
 The service synchronizes messages in the background. Automatic media download
 starts with incoming messages received after the first API startup; existing

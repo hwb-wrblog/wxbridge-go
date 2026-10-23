@@ -36,6 +36,8 @@ type State struct {
 	Notify        *wechat.LoginQRCodeNotify `json:"notify,omitempty"`
 	Authenticated bool                      `json:"authenticated"`
 	Pending       []*wechat.AddMsg          `json:"pending,omitempty"`
+	PendingBase   uint64                    `json:"pending_base,omitempty"`
+	LogoutPending bool                      `json:"logout_pending,omitempty"`
 }
 
 type Session struct {
@@ -63,11 +65,17 @@ func Open(dir string) (*Session, error) {
 	if err := json.Unmarshal(data, &s.State); err != nil {
 		return nil, fmt.Errorf("invalid session file: %w", err)
 	}
-	if s.State.User == nil || s.State.User.DeviceInfo == nil {
-		return nil, errors.New("invalid session: missing device")
-	}
 	if s.State.ClientVersion != ClientVersion {
 		return nil, errors.New("legacy session profile is unsupported; create a fresh QR in a new state directory")
+	}
+	if err := s.finishLogout(); err != nil {
+		return nil, err
+	}
+	if s.State.User == nil && !s.State.Authenticated {
+		return s, nil
+	}
+	if s.State.User == nil || s.State.User.DeviceInfo == nil {
+		return nil, errors.New("invalid session: missing device")
 	}
 	s.State.User.MMInfo = nil
 	if !s.State.Authenticated {
@@ -111,7 +119,15 @@ func (s *Session) Save() error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), filepath.Join(s.Dir, "session.json"))
+	if err := os.Rename(tmp.Name(), filepath.Join(s.Dir, "session.json")); err != nil {
+		return err
+	}
+	dir, err := os.Open(s.Dir)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func Handshake(host string) (*mmtls.MMInfo, error) {
@@ -166,8 +182,11 @@ func responseOK(r *wechat.BaseResponse) error {
 }
 
 func (s *Session) QR() (string, error) {
+	if err := s.finishLogout(); err != nil {
+		return "", err
+	}
 	if s.State.Authenticated {
-		return "", errors.New("session is already authenticated; use a different state directory for another account")
+		return "", errors.New("session is already authenticated; log out before switching accounts")
 	}
 	user := clientsdk.NewUserInfo(baseutils.RandomSmallHexString(32), "", nil)
 	applyDeviceProfile(user)
@@ -180,7 +199,7 @@ func (s *Session) QR() (string, error) {
 		return "", err
 	}
 	user.LoginDataInfo.LoginData = loginData
-	s.State = State{User: user, ClientVersion: ClientVersion}
+	s.State = State{User: user, ClientVersion: ClientVersion, PendingBase: s.MessageCursor()}
 	if err := s.connect(); err != nil {
 		return "", err
 	}
@@ -344,6 +363,7 @@ func (s *Session) Login() error {
 			return errors.New("login response has no account UIN")
 		}
 		u.WxId, u.NickName = response.GetAccountInfo().GetWxid(), response.GetAccountInfo().GetNickName()
+		u.HeadURL = n.GetHeadImgUrl()
 		u.SetAutoKey(auth.GetAutoAuthKey().GetBuffer())
 		u.LoginDataInfo.NewPassWord = ""
 		s.State.Notify, s.State.QRKey = nil, nil
@@ -450,10 +470,12 @@ func (s *Session) Sync() ([]*wechat.AddMsg, bool, error) {
 	if len(response.GetKeyBuf().GetBuffer()) == 0 {
 		return nil, false, errors.New("sync response has no cursor")
 	}
+	previousKey, previousPending := s.State.User.SyncKey, s.State.Pending
 	s.State.User.SyncKey = response.GetKeyBuf().GetBuffer()
 	s.State.Pending = append(s.State.Pending, msgs...)
 	// Persist cursor and messages together so a crash does not lose a batch.
 	if err := s.Save(); err != nil {
+		s.State.User.SyncKey, s.State.Pending = previousKey, previousPending
 		return nil, false, err
 	}
 	return msgs, response.GetContinueFlag() != 0, nil

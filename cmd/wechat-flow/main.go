@@ -15,7 +15,7 @@ import (
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: wechat-flow [-state DIR] serve|qr|check|login|watch|status|heartbeat|sync|contact|send|image|emoji|gif|voice|video|download [command flags]")
+		fmt.Fprintln(os.Stderr, "usage: wechat-flow [-state DIR] serve|qr|check|login|logout|watch|status|heartbeat|sync|contact|send|image|emoji|gif|voice|video|download [command flags]")
 		flag.PrintDefaults()
 	}
 	dir := flag.String("state", "../workflow-runtime", "private session directory")
@@ -128,6 +128,10 @@ func run(s *workflow.Session, args []string, out map[string]interface{}) error {
 			return err
 		}
 		out["authenticated"], out["wxid"] = true, s.State.User.WxId
+	case "logout":
+		err := s.Logout()
+		out["authenticated"] = s.State.Authenticated
+		return err
 	case "watch":
 		deadline := time.Now().Add(4 * time.Minute)
 		for time.Now().Before(deadline) {
@@ -149,16 +153,16 @@ func run(s *workflow.Session, args []string, out map[string]interface{}) error {
 		}
 		return errors.New("timed out waiting for phone confirmation")
 	case "status":
-		out["authenticated"] = s.State.Authenticated
+		identity := s.Identity()
+		out["authenticated"], out["wxid"] = identity.Authenticated, identity.WxID
+		out["nickname"], out["avatar_url"] = identity.Nickname, identity.AvatarURL
 		out["qr_state"] = s.State.QRState
 		out["pending_messages"] = len(s.State.Pending)
+		out["acked_cursor"] = s.State.PendingBase
 		out["status_source"] = "local saved state; online status not checked"
 		out["client_version"] = fmt.Sprintf("%#x", workflow.ClientVersion)
 		if s.State.User != nil && s.State.User.DeviceInfo != nil {
 			out["device_token_ready"] = s.State.User.DeviceInfo.DeviceToken.GetTrustResponseData().GetDeviceToken() != ""
-		}
-		if s.State.Authenticated {
-			out["wxid"] = s.State.User.WxId
 		}
 	case "heartbeat":
 		if err := s.Heartbeat(); err != nil {

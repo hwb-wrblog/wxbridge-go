@@ -27,9 +27,17 @@ export class WxBridge {
   status() { return this.request("/v1/status"); }
   qr() { return this.request("/v1/login/qr", { method: "POST" }); }
   checkLogin() { return this.request("/v1/login/check", { method: "POST" }); }
+  logout() { return this.request("/v1/logout", { method: "POST" }); }
   upload(bytes) { return this.request("/v1/uploads", { method: "POST", body: bytes, raw: true }); }
-  messages(cursor = 0, peer = "") {
-    return this.request(`/v1/messages?cursor=${cursor}&peer=${encodeURIComponent(peer)}`);
+  messages(cursor, peer = "") {
+    const params = new URLSearchParams({ peer });
+    if (cursor !== undefined) params.set("cursor", String(cursor));
+    return this.request(`/v1/messages?${params}`);
+  }
+  ack(cursor, { discardPendingMedia = false } = {}) {
+    return this.request("/v1/messages/ack", {
+      method: "POST", body: { cursor, discard_pending_media: discardPendingMedia },
+    });
   }
   send(kind, body, idempotencyKey) {
     if (!idempotencyKey) throw new Error("Supply a stable unique key for this intended message");

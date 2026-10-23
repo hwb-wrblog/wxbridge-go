@@ -161,10 +161,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	path := strings.TrimSuffix(r.URL.Path, "/")
-	if path == "/v1/uploads" && r.Method == http.MethodPost {
-		s.upload(w, r)
-		return
-	}
 	if strings.HasPrefix(path, "/v1/media/") && r.Method == http.MethodGet {
 		s.mediaFile(w, r, strings.TrimPrefix(path, "/v1/media/"))
 		return
@@ -174,15 +170,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := r.Context().Err(); err != nil {
 		return
 	}
+	if s.session.State.LogoutPending && path != "/v1/logout" && path != "/v1/status" && path != "/healthz" {
+		respond(w, 409, map[string]interface{}{"ok": false, "error": "logout cleanup is incomplete; retry /v1/logout"})
+		return
+	}
 	switch {
 	case path == "/healthz" && r.Method == http.MethodGet:
 		respond(w, 200, map[string]interface{}{"ok": true, "service": "wxbridge"})
 	case path == "/v1/status" && r.Method == http.MethodGet:
-		respond(w, 200, map[string]interface{}{"ok": true, "authenticated": s.session.State.Authenticated, "client_version": fmt.Sprintf("%#x", workflow.ClientVersion), "pending_messages": len(s.session.State.Pending), "last_sync": s.lastSync, "last_heartbeat": s.lastHeartbeat, "last_error": s.lastError, "auto_download": s.config.AutoDownload})
+		identity := s.session.Identity()
+		respond(w, 200, map[string]interface{}{"ok": true, "authenticated": identity.Authenticated, "wxid": identity.WxID, "nickname": identity.Nickname, "avatar_url": identity.AvatarURL, "logout_pending": s.session.State.LogoutPending, "client_version": fmt.Sprintf("%#x", workflow.ClientVersion), "pending_messages": len(s.session.State.Pending), "acked_cursor": s.session.State.PendingBase, "last_sync": s.lastSync, "last_heartbeat": s.lastHeartbeat, "last_error": s.lastError, "auto_download": s.config.AutoDownload})
 	case path == "/v1/capabilities" && r.Method == http.MethodGet:
 		respond(w, 200, map[string]interface{}{"ok": true, "live_verified": []string{"qr_login", "text", "image", "existing_emoji", "custom_gif_server_ack", "amr_voice", "mp4_video"}, "offline_only": []string{"automatic_media_download", "silk_voice"}, "realtime_calls": false})
 	case path == "/v1/messages" && r.Method == http.MethodGet:
 		s.messages(w, r)
+	case path == "/v1/messages/ack" && r.Method == http.MethodPost:
+		s.ackMessages(w, r)
+	case path == "/v1/logout" && r.Method == http.MethodPost:
+		err := s.session.Logout()
+		if !s.session.State.Authenticated {
+			s.lastSync, s.lastHeartbeat, s.lastError = 0, 0, ""
+		}
+		if err == nil {
+			s.autoSince = time.Now().Unix()
+			data, _ := json.Marshal(map[string]int64{"auto_since": s.autoSince})
+			err = atomicWrite(filepath.Join(s.session.Dir, "api-state.json"), data)
+		}
+		result(w, s.session.Identity(), err)
+	case path == "/v1/uploads" && r.Method == http.MethodPost:
+		s.upload(w, r)
 	case path == "/v1/login/qr" && r.Method == http.MethodPost:
 		_, err := s.session.QR()
 		result(w, map[string]interface{}{"image_url": "/v1/login/qr/image", "expires": s.session.State.Expires}, err)
@@ -291,12 +307,16 @@ func atomicWrite(path string, data []byte) error {
 }
 
 func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
-	cursor, err := strconv.Atoi(r.URL.Query().Get("cursor"))
+	cursor, err := strconv.ParseUint(r.URL.Query().Get("cursor"), 10, 64)
 	if r.URL.Query().Get("cursor") == "" {
-		cursor, err = 0, nil
+		cursor, err = s.session.State.PendingBase, nil
 	}
-	if err != nil || cursor < 0 || cursor > len(s.session.State.Pending) {
+	if err != nil || cursor > s.session.MessageCursor() {
 		respond(w, 400, map[string]interface{}{"ok": false, "error": "invalid message cursor"})
+		return
+	}
+	if cursor < s.session.State.PendingBase {
+		respond(w, 410, map[string]interface{}{"ok": false, "error": "messages before this cursor were acknowledged or cleared by logout", "acked_cursor": s.session.State.PendingBase})
 		return
 	}
 	limit := 100
@@ -313,19 +333,18 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peer := r.URL.Query().Get("peer")
+	self := s.session.Identity().WxID
 	items := make([]map[string]interface{}, 0)
-	for cursor < len(s.session.State.Pending) && len(items) < limit {
-		message := s.session.State.Pending[cursor]
+	for cursor < s.session.MessageCursor() && len(items) < limit {
+		message := s.session.State.Pending[cursor-s.session.State.PendingBase]
 		cursor++
 		from, to := message.GetFromUserName().GetStr(), message.GetToUserName().GetStr()
 		if peer != "" && from != peer && to != peer {
 			continue
 		}
 		id := workflow.MessageID(message)
-		item := map[string]interface{}{"id": id, "from": from, "to": to, "type": message.GetMsgType(), "created": message.GetCreateTime()}
-		if message.GetMsgType() == 1 {
-			item["text"] = message.GetContent().GetStr()
-		}
+		item := projectMessage(message, self)
+		item["cursor"] = cursor
 		if kind := workflow.MediaKind(message.GetMsgType()); kind != "" {
 			item["media_kind"] = kind
 			if file := files[id]; file != nil {
@@ -337,13 +356,53 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, item)
 	}
-	respond(w, 200, map[string]interface{}{"ok": true, "messages": items, "next_cursor": cursor, "more": cursor < len(s.session.State.Pending)})
+	respond(w, 200, map[string]interface{}{"ok": true, "messages": items, "next_cursor": cursor, "acked_cursor": s.session.State.PendingBase, "more": cursor < s.session.MessageCursor()})
+}
+
+func (s *Server) ackMessages(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Cursor              *uint64 `json:"cursor"`
+		DiscardPendingMedia bool    `json:"discard_pending_media"`
+	}
+	if err := readJSON(w, r, &body); err != nil || body.Cursor == nil {
+		respond(w, 400, map[string]interface{}{"ok": false, "error": "cursor must be a nonnegative integer"})
+		return
+	}
+	cursor := *body.Cursor
+	if cursor > s.session.MessageCursor() {
+		respond(w, 400, map[string]interface{}{"ok": false, "error": "acknowledgement cursor is beyond the saved inbox"})
+		return
+	}
+	if !body.DiscardPendingMedia && cursor > s.session.State.PendingBase {
+		files, err := s.session.MediaFiles()
+		if err != nil {
+			result(w, nil, err)
+			return
+		}
+		self := s.session.Identity().WxID
+		for _, message := range s.session.State.Pending[:cursor-s.session.State.PendingBase] {
+			if workflow.MediaKind(message.GetMsgType()) == "" || projectMessage(message, self)["direction"] == "outgoing" {
+				continue
+			}
+			id := workflow.MessageID(message)
+			if file := files[id]; file == nil || file.Status != "ready" {
+				respond(w, 409, map[string]interface{}{"ok": false, "error": "download incoming media before acknowledgement, or explicitly set discard_pending_media", "message_id": id})
+				return
+			}
+		}
+	}
+	count, err := s.session.AckMessages(cursor)
+	result(w, map[string]interface{}{"acknowledged": count, "acked_cursor": s.session.State.PendingBase, "pending_messages": len(s.session.State.Pending)}, err)
 }
 
 func (s *Server) mediaFile(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session.State.LogoutPending {
+		respond(w, 409, map[string]interface{}{"ok": false, "error": "logout cleanup is incomplete; retry /v1/logout"})
+		return
+	}
 	path, file, err := s.session.MediaPath(id)
-	s.mu.Unlock()
 	if err != nil {
 		respond(w, 404, map[string]interface{}{"ok": false, "error": err.Error()})
 		return
@@ -402,7 +461,7 @@ func (s *Server) backgroundOnce(ctx context.Context) {
 		return
 	}
 	for _, message := range s.session.State.Pending {
-		if int64(message.GetCreateTime()) < s.autoSince || workflow.MediaKind(message.GetMsgType()) == "" || message.GetFromUserName().GetStr() == s.session.State.User.WxId {
+		if int64(message.GetCreateTime()) < s.autoSince || workflow.MediaKind(message.GetMsgType()) == "" || projectMessage(message, s.session.Identity().WxID)["direction"] == "outgoing" {
 			continue
 		}
 		id := workflow.MessageID(message)
